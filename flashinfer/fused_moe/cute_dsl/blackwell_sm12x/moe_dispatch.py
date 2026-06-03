@@ -472,6 +472,83 @@ def _get_weight_views(
 # Kernel compilation cache
 # ---------------------------------------------------------------------------
 _STATIC_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
+_STATIC_RT_KERNEL_CACHE: Dict[Tuple, Tuple] = {}
+
+
+class _StaticMoELaunch:
+    """Thin JIT wrapper that makes num_tokens runtime-shaped for static MoE.
+
+    Mirrors _DynamicMoELaunch: runtime-shaped tensors (a_input, topk_ids,
+    topk_weights, scatter_output) are passed as raw pointers and constructed
+    with runtime layouts inside the JIT wrapper via cute.make_tensor().
+    This removes m from the compile-time cache key.
+    """
+
+    def __init__(self, kernel, k: int, num_topk: int):
+        self._kernel = kernel
+        self._k = int(k)
+        self._num_topk = int(num_topk)
+
+    @cute.jit
+    def __call__(
+        self,
+        a_ptr: cute.Pointer,
+        topk_ids_ptr: cute.Pointer,
+        topk_weights_ptr: cute.Pointer,
+        packed_a: cute.Tensor,
+        sfa_ptr: cute.Pointer,
+        packed_a_storage: cute.Tensor,
+        scale_storage: cute.Tensor,
+        barrier_count: cute.Tensor,
+        barrier_epoch: cute.Tensor,
+        b_w13: cute.Tensor,
+        sfb_w13_ptr: cute.Pointer,
+        b_down: cute.Tensor,
+        sfb_down_ptr: cute.Pointer,
+        row_counts: cute.Tensor,
+        active_expert_count: cute.Tensor,
+        weight_expert_ids: cute.Tensor,
+        global_to_local_expert: cute.Tensor,
+        input_global_scale: cute.Tensor,
+        alpha: cute.Tensor,
+        down_alpha: cute.Tensor,
+        global_scale: cute.Tensor,
+        scatter_ptr: cute.Pointer,
+        token_map: cute.Tensor,
+        token_weights: cute.Tensor,
+        num_tokens: cutlass.Int32,
+        max_active_clusters: cutlass.Constexpr,
+        stream,
+    ):
+        a_input = cute.make_tensor(
+            a_ptr,
+            layout=cute.make_layout((num_tokens, self._k), stride=(self._k, 1)),
+        )
+        topk_ids = cute.make_tensor(
+            topk_ids_ptr,
+            layout=cute.make_layout((num_tokens * self._num_topk,), stride=(1,)),
+        )
+        topk_weights_t = cute.make_tensor(
+            topk_weights_ptr,
+            layout=cute.make_layout((num_tokens * self._num_topk,), stride=(1,)),
+        )
+        scatter_output = cute.make_tensor(
+            scatter_ptr,
+            layout=cute.make_layout((num_tokens, self._k), stride=(self._k, 1)),
+        )
+
+        self._kernel(
+            a_input, topk_ids, topk_weights_t,
+            packed_a, sfa_ptr, packed_a_storage, scale_storage,
+            barrier_count, barrier_epoch,
+            b_w13, sfb_w13_ptr, b_down, sfb_down_ptr,
+            row_counts, active_expert_count, weight_expert_ids,
+            global_to_local_expert,
+            input_global_scale, alpha, down_alpha, global_scale,
+            scatter_output, token_map, token_weights,
+            max_active_clusters=max_active_clusters,
+            stream=stream,
+        )
 
 
 def _get_static_kernel(
@@ -706,6 +783,140 @@ def _get_static_kernel(
 
     result = (compiled, mac)
     _STATIC_KERNEL_CACHE[cache_key] = result
+    return result
+
+
+def _get_static_kernel_rt(
+    state_E: int,
+    weight_E: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    max_rows: int,
+    *,
+    mma_tiler_mn: Tuple[int, int] = (128, 128),
+    topk_ids_dtype: torch.dtype = torch.int32,
+    input_scales_are_reciprocal: bool = False,
+    fast_math: bool = True,
+    mac_override: int | None = None,
+    activation: str = "silu",
+    activation_precision: str = "fp4",
+):
+    """Compile static MoE kernel with runtime num_tokens via _StaticMoELaunch.
+
+    Like _get_static_kernel but m is NOT in the cache key. Uses pointer-based
+    fake args for runtime-shaped tensors. Only for non-CUDA-graph paths.
+    """
+    activation_precision = _normalize_activation_precision(activation_precision)
+    if activation_precision == "bf16":
+        raise ValueError(
+            "internal routing error: quant_mode='w4a16' reached the NVFP4 static compiler"
+        )
+    sf_vec_size = 16
+    sm_count = get_num_sm(torch.device("cuda"))
+    mac = (
+        mac_override
+        if mac_override is not None
+        else min(get_max_active_clusters(1), sm_count)
+    )
+
+    # For runtime-m path: fix mac to hardware limit (no tuned ladder)
+    # to avoid per-batch recompilation from varying mac values.
+    # max_rows stays in the key since workspace tensors use it as a concrete shape.
+    rt_mac = min(get_max_active_clusters(1), sm_count)
+
+    cache_key = (
+        "static_rt",
+        activation_precision, state_E, weight_E, k, n, num_topk,
+        max_rows, rt_mac, mma_tiler_mn,
+        topk_ids_dtype, input_scales_are_reciprocal, fast_math, activation,
+    )
+    cached = _STATIC_RT_KERNEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    import logging as _logging
+    _logging.getLogger("moe_dispatch").warning("_get_static_kernel_rt COMPILING full_key=%s", cache_key)
+
+    ab_dtype = cutlass.Float4E2M1FN
+    weight_dtype = cutlass.Float4E2M1FN
+    sf_dtype = cutlass.Float8E4M3FN
+    a_dtype = cutlass.BFloat16
+    alpha_dtype = cutlass.Float32
+
+    output_tile_count_n = max(1, (n + mma_tiler_mn[1] - 1) // mma_tiler_mn[1])
+    kernel: Any = MoEStaticKernel(
+        sf_vec_size=sf_vec_size,
+        mma_tiler_mn=mma_tiler_mn,
+        output_tile_count_n=output_tile_count_n,
+        fast_math=fast_math,
+        activation=activation,
+        input_scales_are_reciprocal=input_scales_are_reciprocal,
+    )
+    launch = _StaticMoELaunch(kernel, k=k, num_topk=num_topk)
+
+    is_gated = activation == "silu"
+    w1_rows = (2 if is_gated else 1) * n
+
+    rows_pad_k = _align_up(max_rows, 128)
+    cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
+
+    topk_ids_cutlass_dtype = (
+        cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
+    )
+    topk_ids_align = 4 if topk_ids_dtype == torch.int32 else 8
+
+    # Runtime-shaped: pointer fakes
+    a_input_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    topk_ids_fake = make_ptr(topk_ids_cutlass_dtype, topk_ids_align, cute.AddressSpace.gmem, assumed_align=topk_ids_align)
+    topk_weights_fake = make_ptr(cutlass.Float32, 4, cute.AddressSpace.gmem, assumed_align=4)
+    scatter_fake = make_ptr(a_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+
+    # Fixed-capacity: concrete fake tensors (use max_rows from workspace)
+    packed_a_fake = cute.runtime.make_fake_compact_tensor(ab_dtype, (max_rows, k, state_E), stride_order=(1, 0, 2), assumed_align=16)
+    sfa_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    packed_a_storage_fake = cute.runtime.make_fake_compact_tensor(cutlass.Uint8, (state_E * max_rows * (k // 2),), assumed_align=16)
+    scale_storage_fake = cute.runtime.make_fake_compact_tensor(cutlass.Uint8, (state_E * rows_pad_k * cols_pad_k,), assumed_align=16)
+    barrier_count_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (1,), assumed_align=4)
+    barrier_epoch_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (1,), assumed_align=4)
+    b_w13_fake = cute.runtime.make_fake_compact_tensor(weight_dtype, (w1_rows, k, weight_E), stride_order=(1, 0, 2), assumed_align=16)
+    sfb_w13_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    b_down_fake = cute.runtime.make_fake_compact_tensor(weight_dtype, (k, n, weight_E), stride_order=(1, 0, 2), assumed_align=16)
+    sfb_down_fake = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
+    row_counts_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (state_E,), assumed_align=4)
+    active_expert_count_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (1,), assumed_align=4)
+    weight_expert_ids_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (state_E,), assumed_align=4)
+    global_to_local_expert_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (weight_E,), assumed_align=4)
+    input_gs_fake = cute.runtime.make_fake_compact_tensor(alpha_dtype, (weight_E,), assumed_align=16)
+    alpha_fake = cute.runtime.make_fake_compact_tensor(alpha_dtype, (weight_E,), assumed_align=16)
+    down_alpha_fake = cute.runtime.make_fake_compact_tensor(alpha_dtype, (weight_E,), assumed_align=16)
+    global_scale_fake = cute.runtime.make_fake_compact_tensor(alpha_dtype, (weight_E,), assumed_align=16)
+    token_map_fake = cute.runtime.make_fake_compact_tensor(cutlass.Int32, (state_E, max_rows), stride_order=(1, 0), assumed_align=4)
+    token_weights_fake = cute.runtime.make_fake_compact_tensor(alpha_dtype, (state_E, max_rows), stride_order=(1, 0), assumed_align=16)
+
+    compiled = cute.compile(
+        launch,
+        a_input_fake, topk_ids_fake, topk_weights_fake,
+        packed_a_fake, sfa_fake, packed_a_storage_fake, scale_storage_fake,
+        barrier_count_fake, barrier_epoch_fake,
+        b_w13_fake, sfb_w13_fake, b_down_fake, sfb_down_fake,
+        row_counts_fake, active_expert_count_fake, weight_expert_ids_fake,
+        global_to_local_expert_fake,
+        input_gs_fake, alpha_fake, down_alpha_fake, global_scale_fake,
+        scatter_fake, token_map_fake, token_weights_fake,
+        1,  # num_tokens placeholder
+        rt_mac,
+        current_cuda_stream(),
+        options="--opt-level 2 --enable-tvm-ffi",
+    )
+
+    result = (compiled, rt_mac)
+    _STATIC_RT_KERNEL_CACHE[cache_key] = result
+    import logging as _logging
+    _logging.getLogger("moe_dispatch").warning(
+        "_get_static_kernel_rt STORED cache_id=%d len=%d key=%s",
+        id(_STATIC_RT_KERNEL_CACHE), len(_STATIC_RT_KERNEL_CACHE), cache_key,
+    )
     return result
 
 
@@ -1007,6 +1218,7 @@ def launch_sm120_static_moe(
     if top_k > 1:
         micro_cutover = _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK
     use_micro = activation_precision == "fp4" and routed_rows <= micro_cutover
+    _use_rt = False  # runtime-m wrapper flag (set in static non-graph path)
 
     sm_count = get_num_sm(torch.device("cuda"))
     base_mac = min(get_max_active_clusters(1), sm_count)
@@ -1085,50 +1297,110 @@ def launch_sm120_static_moe(
             activation=activation,
         )
     else:
-        compiled, mac = _get_static_kernel(
-            workspace.state_E,
-            num_experts,
-            num_tokens,
-            k,
-            n,
-            top_k,
-            workspace.max_rows,
-            topk_ids_dtype=torch.int32,
-            input_scales_are_reciprocal=input_scales_are_reciprocal,
-            fast_math=fast_math,
-            mac_override=static_mac,
-            activation=activation,
-            activation_precision=activation_precision,
-        )
+        # Select tile shape for this batch
+        static_mma_tiler_mn = (128, 128)
+        if activation_precision == "fp4" and top_k > 1:
+            static_mma_tiler_mn = _select_moe_mma_tiler_mn(routed_rows, n)
+
+        # Use runtime-m wrapper for non-graph paths (avoids per-m JIT).
+        # Use original per-m kernel for CUDA graph capture (graph needs fixed shapes).
+        _use_rt = not _is_cuda_graph_capturing()
+
+        if _use_rt:
+            # RT path: fix tile shape to (128, 128) to avoid per-routed_rows recompilation.
+            # The tuned tile selector varies with routed_rows, creating new cache keys.
+            rt_mma_tiler_mn = (128, 128)
+            compiled, mac = _get_static_kernel_rt(
+                workspace.state_E,
+                num_experts,
+                k,
+                n,
+                top_k,
+                workspace.max_rows,
+                mma_tiler_mn=rt_mma_tiler_mn,
+                topk_ids_dtype=torch.int32,
+                input_scales_are_reciprocal=input_scales_are_reciprocal,
+                fast_math=fast_math,
+                mac_override=static_mac,
+                activation=activation,
+                activation_precision=activation_precision,
+            )
+        else:
+            compiled, mac = _get_static_kernel(
+                workspace.state_E,
+                num_experts,
+                num_tokens,
+                k,
+                n,
+                top_k,
+                workspace.max_rows,
+                topk_ids_dtype=torch.int32,
+                input_scales_are_reciprocal=input_scales_are_reciprocal,
+                fast_math=fast_math,
+                mac_override=static_mac,
+                activation=activation,
+                activation_precision=activation_precision,
+            )
         launch_ids = flat_ids
 
-    # Pointer arguments must be passed as raw ints (data_ptr()) at runtime.
-    runtime_args: Tuple[Any, ...] = (
-        a,
-        launch_ids,
-        flat_weights,
-        workspace.packed_a_view,
-        workspace.packed_input_scale.data_ptr(),
-        workspace.packed_a_flat,
-        workspace.scale_flat,
-        workspace.barrier_count,
-        workspace.barrier_epoch,
-        weights.w13_fp4,
-        weights._w13_sf_storage.data_ptr(),
-        weights.down_fp4,
-        weights._down_sf_storage.data_ptr(),
-        workspace.row_counts,
-        workspace.active_expert_count,
-        workspace.weight_expert_ids,
-        workspace.global_to_local_expert,
-        input_gs,
-        weights.w1_alpha,
-        weights.w2_alpha,
-        down_input_scale,
-        scatter_output,
-        workspace.token_map,
-        workspace.token_weights,
-    )
+    # Build runtime args based on path
+    if _use_rt:
+        # Runtime-m static: pointer args + num_tokens
+        runtime_args: Tuple[Any, ...] = (
+            a.data_ptr(),
+            launch_ids.data_ptr(),
+            flat_weights.data_ptr(),
+            workspace.packed_a_view,
+            workspace.packed_input_scale.data_ptr(),
+            workspace.packed_a_flat,
+            workspace.scale_flat,
+            workspace.barrier_count,
+            workspace.barrier_epoch,
+            weights.w13_fp4,
+            weights._w13_sf_storage.data_ptr(),
+            weights.down_fp4,
+            weights._down_sf_storage.data_ptr(),
+            workspace.row_counts,
+            workspace.active_expert_count,
+            workspace.weight_expert_ids,
+            workspace.global_to_local_expert,
+            input_gs,
+            weights.w1_alpha,
+            weights.w2_alpha,
+            down_input_scale,
+            scatter_output.data_ptr(),
+            workspace.token_map,
+            workspace.token_weights,
+            num_tokens,
+        )
+    else:
+        # Micro or CUDA-graph static: original tensor-based args
+        runtime_args = (
+            a,
+            launch_ids,
+            flat_weights,
+            workspace.packed_a_view,
+            workspace.packed_input_scale.data_ptr(),
+            workspace.packed_a_flat,
+            workspace.scale_flat,
+            workspace.barrier_count,
+            workspace.barrier_epoch,
+            weights.w13_fp4,
+            weights._w13_sf_storage.data_ptr(),
+            weights.down_fp4,
+            weights._down_sf_storage.data_ptr(),
+            workspace.row_counts,
+            workspace.active_expert_count,
+            workspace.weight_expert_ids,
+            workspace.global_to_local_expert,
+            input_gs,
+            weights.w1_alpha,
+            weights.w2_alpha,
+            down_input_scale,
+            scatter_output,
+            workspace.token_map,
+            workspace.token_weights,
+        )
     compiled(*runtime_args, current_cuda_stream())
 
     return scatter_output
