@@ -149,6 +149,10 @@ def _normalize_quant_mode(
         "fp4": "nvfp4",
         "nvfp4": "nvfp4",
         "w4a4": "nvfp4",
+        "mxfp4": "mxfp4",
+        "mxf4": "mxfp4",
+        "w4a4_mx": "mxfp4",
+        "w4a4-mx": "mxfp4",
         "bf16": "w4a16",
         "w4a16": "w4a16",
     }
@@ -156,8 +160,20 @@ def _normalize_quant_mode(
         return aliases[normalized]
     except KeyError as exc:
         raise ValueError(
-            f"quant_mode must be 'nvfp4'/'w4a4' or 'w4a16' (got {quant_mode!r})."
+            f"quant_mode must be 'nvfp4'/'w4a4', 'mxfp4'/'w4a4-mx', or 'w4a16' "
+            f"(got {quant_mode!r})."
         ) from exc
+
+
+def _sf_params_for_quant_mode(quant_mode: str):
+    """(sf_vec_size, sf_dtype, block_size) for an FP4 dispatch mode.
+
+    NVFP4: 16-element E4M3 block scales.  MXFP4: 32-element E8M0 block scales.
+    """
+    mode = _normalize_quant_mode(quant_mode)
+    if mode == "mxfp4":
+        return 32, cutlass.Float8E8M0FNU, 32
+    return 16, cutlass.Float8E4M3FN, _NVFP4_BLOCK_SIZE
 
 
 def _activation_precision_from_quant_mode(quant_mode: str) -> str:
@@ -293,6 +309,7 @@ def allocate_sm120_static_workspace(
     num_topk: int,
     device: torch.device,
     activation_precision: str = "fp4",
+    quant_mode: str = "nvfp4",
 ) -> Sm120StaticMoEWorkspace:
     """Allocate workspace buffers for the SM120 static MoE kernel."""
     activation_precision = _normalize_activation_precision(activation_precision)
@@ -302,8 +319,9 @@ def allocate_sm120_static_workspace(
             "use allocate_sm120_moe_workspace(..., quant_mode='w4a16') for W4A16."
         )
 
+    sf_vec_size, _sf_dt, _sf_block = _sf_params_for_quant_mode(quant_mode)
     rows_pad_k = _align_up(max_rows, 128)
-    cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    cols_pad_k = _align_up(k // sf_vec_size, 4)
     packed_input = torch.empty(
         state_E, max_rows, k // 2, dtype=torch.uint8, device=device
     )
@@ -337,7 +355,7 @@ def allocate_sm120_static_workspace(
     )
 
     # Finalize views
-    sf_dtype = cutlass.Float8E4M3FN
+    sf_dtype = _sf_dt
     workspace.packed_a_view = workspace.packed_input.permute(1, 2, 0).view(
         torch.float4_e2m1fn_x2
     )
@@ -384,6 +402,7 @@ def _get_weight_views(
     n: int,
     k: int,
     activation_precision: str = "fp4",
+    quant_mode: str = "nvfp4",
 ) -> _WeightViews:
     """Create permuted weight views for the static kernel.
 
@@ -391,6 +410,7 @@ def _get_weight_views(
     via a single TMA descriptor.
     """
     activation_precision = _normalize_activation_precision(activation_precision)
+    sf_vec_size, _sf_dt, _sf_block = _sf_params_for_quant_mode(quant_mode)
     tile_n = _level_tile_n(activation_precision)
     # The kernel splits w13 into gate/up halves by tile index. This only works
     # when the boundary between halves lands on a tile-aligned column.
@@ -402,6 +422,7 @@ def _get_weight_views(
 
     key = (
         activation_precision,
+        sf_vec_size,
         w1_fp4.data_ptr(),
         w1_blockscale.data_ptr(),
         w1_alphas.data_ptr(),
@@ -424,19 +445,21 @@ def _get_weight_views(
     # We need the ORIGINAL physical storage, not .contiguous() of the view
     # (which would write in permuted logical order).
     # convert_sf_from_mma_layout reverses the permutation back to 2D swizzled.
-    sf_dtype = cutlass.Float8E4M3FN
+    sf_dtype = _sf_dt
     w1_rows = w1_fp4.shape[1]  # 2*n for gated, n for non-gated
     w13_sf_contiguous = convert_sf_from_mma_layout(
         w1_blockscale,
         m=w1_rows,
         k=k,
         num_groups=w1_fp4.shape[0],  # num_local_experts
+        sf_vec_size=sf_vec_size,
     ).contiguous()
     down_sf_contiguous = convert_sf_from_mma_layout(
         w2_blockscale,
         m=k,
         k=n,
         num_groups=w2_fp4.shape[0],
+        sf_vec_size=sf_vec_size,
     ).contiguous()
 
     views = _WeightViews(
@@ -566,6 +589,7 @@ def _get_static_kernel(
     mac_override: int | None = None,
     activation: str = "silu",
     activation_precision: str = "fp4",
+    quant_mode: str = "nvfp4",
 ):
     """Compile (or retrieve cached) the SM120 static MoE kernel."""
     activation_precision = _normalize_activation_precision(activation_precision)
@@ -573,7 +597,7 @@ def _get_static_kernel(
         raise ValueError(
             "internal routing error: quant_mode='w4a16' reached the NVFP4 static compiler"
         )
-    sf_vec_size = 16
+    sf_vec_size, sf_dtype, _sf_block = _sf_params_for_quant_mode(quant_mode)
     sm_count = get_num_sm(torch.device("cuda"))
     mac = (
         mac_override
@@ -590,6 +614,7 @@ def _get_static_kernel(
     cache_key = (
         "static",
         activation_precision,
+        sf_vec_size,
         state_E,
         weight_E,
         m,
@@ -610,7 +635,6 @@ def _get_static_kernel(
 
     ab_dtype = cutlass.Float4E2M1FN
     weight_dtype = cutlass.Float4E2M1FN
-    sf_dtype = cutlass.Float8E4M3FN
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
 
@@ -628,7 +652,7 @@ def _get_static_kernel(
     w1_rows = (2 if is_gated else 1) * n  # 2*n for gated, n for non-gated
 
     rows_pad_k = _align_up(max_rows, 128)
-    cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    cols_pad_k = _align_up(k // sf_vec_size, 4)
 
     # Build fake tensors for compilation
     a_input_fake = cute.runtime.make_fake_compact_tensor(
@@ -1185,6 +1209,7 @@ def launch_sm120_static_moe(
     fast_math: bool = True,
     activation: str = "silu",
     activation_precision: str = "fp4",
+    quant_mode: str = "nvfp4",
 ) -> torch.Tensor:
     """Launch the SM120 static or micro MoE kernel.
 
@@ -1219,6 +1244,12 @@ def launch_sm120_static_moe(
         micro_cutover = _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK
     use_micro = activation_precision == "fp4" and routed_rows <= micro_cutover
     _use_rt = False  # runtime-m wrapper flag (set in static non-graph path)
+
+    # MXFP4 (W4A4-mx) currently supports only the plain static kernel; the
+    # micro and runtime-m paths are NVFP4-specialized (Stage D/E will port them).
+    _is_mxfp4 = _normalize_quant_mode(quant_mode) == "mxfp4"
+    if _is_mxfp4:
+        use_micro = False
 
     sm_count = get_num_sm(torch.device("cuda"))
     base_mac = min(get_max_active_clusters(1), sm_count)
@@ -1304,7 +1335,9 @@ def launch_sm120_static_moe(
 
         # Use runtime-m wrapper for non-graph paths (avoids per-m JIT).
         # Use original per-m kernel for CUDA graph capture (graph needs fixed shapes).
-        _use_rt = not _is_cuda_graph_capturing()
+        # MXFP4 (W4A4-mx): the RT wrapper is NVFP4-specialized (sf_vec_size=16);
+        # force the per-m static kernel until Stage D/E ports the RT path.
+        _use_rt = (not _is_cuda_graph_capturing()) and not _is_mxfp4
 
         if _use_rt:
             # RT path: fix tile shape to (128, 128) to avoid per-routed_rows recompilation.
@@ -1340,6 +1373,7 @@ def launch_sm120_static_moe(
                 mac_override=static_mac,
                 activation=activation,
                 activation_precision=activation_precision,
+                quant_mode=quant_mode,
             )
         launch_ids = flat_ids
 
@@ -1422,6 +1456,10 @@ def select_sm120_moe_backend(
     mode = _normalize_quant_mode(quant_mode, activation_precision)
     if mode == "w4a16":
         return "w4a16"
+    # MXFP4 (W4A4-mx) currently has only the static kernel ported; the dynamic
+    # path is NVFP4-specialized (Stage D/E will port it).
+    if mode == "mxfp4":
+        return "static"
     routed_rows = num_tokens * num_topk
     if routed_rows <= _get_static_compact_cutover_pairs("fp4"):
         return "static"
@@ -2558,6 +2596,7 @@ def allocate_sm120_moe_workspace(
             num_topk=num_topk,
             device=device,
             activation_precision=activation_precision,
+            quant_mode=mode,
         )
     raise ValueError(f"unsupported SM120 MoE backend {backend!r}")
 
