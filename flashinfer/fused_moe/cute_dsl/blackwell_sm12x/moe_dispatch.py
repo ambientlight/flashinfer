@@ -1248,10 +1248,10 @@ def launch_sm120_static_moe(
     use_micro = activation_precision == "fp4" and routed_rows <= micro_cutover
     _use_rt = False  # runtime-m wrapper flag (set in static non-graph path)
 
-    # MXFP4 (W4A4-mx) now supports the micro and plain-static kernels (Stage D
-    # ported their 32-element E8M0 quant). The runtime-m (RT) wrapper remains
-    # NVFP4-specialized, so it is disabled for mxfp4 below.
-    _is_mxfp4 = _normalize_quant_mode(quant_mode) == "mxfp4"
+    # MXFP4 (W4A4-mx) is fully supported on the micro, plain-static, and
+    # runtime-m (RT) paths (Stage D ported the kernels; the RT wrapper was
+    # parameterized for sf_vec_size=32). No mxfp4-specific dispatch gating is
+    # needed here — backend/RT selection below is quant-mode agnostic.
 
     sm_count = get_num_sm(torch.device("cuda"))
     base_mac = min(get_max_active_clusters(1), sm_count)
