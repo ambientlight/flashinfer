@@ -825,6 +825,7 @@ def _get_static_kernel_rt(
     mac_override: int | None = None,
     activation: str = "silu",
     activation_precision: str = "fp4",
+    quant_mode: str = "nvfp4",
 ):
     """Compile static MoE kernel with runtime num_tokens via _StaticMoELaunch.
 
@@ -836,7 +837,7 @@ def _get_static_kernel_rt(
         raise ValueError(
             "internal routing error: quant_mode='w4a16' reached the NVFP4 static compiler"
         )
-    sf_vec_size = 16
+    sf_vec_size, _rt_sf_dtype, _rt_sf_block = _sf_params_for_quant_mode(quant_mode)
     sm_count = get_num_sm(torch.device("cuda"))
     mac = (
         mac_override
@@ -851,7 +852,7 @@ def _get_static_kernel_rt(
 
     cache_key = (
         "static_rt",
-        activation_precision, state_E, weight_E, k, n, num_topk,
+        activation_precision, sf_vec_size, state_E, weight_E, k, n, num_topk,
         max_rows, rt_mac, mma_tiler_mn,
         topk_ids_dtype, input_scales_are_reciprocal, fast_math, activation,
     )
@@ -864,7 +865,7 @@ def _get_static_kernel_rt(
 
     ab_dtype = cutlass.Float4E2M1FN
     weight_dtype = cutlass.Float4E2M1FN
-    sf_dtype = cutlass.Float8E4M3FN
+    sf_dtype = _rt_sf_dtype
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
 
@@ -883,7 +884,7 @@ def _get_static_kernel_rt(
     w1_rows = (2 if is_gated else 1) * n
 
     rows_pad_k = _align_up(max_rows, 128)
-    cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    cols_pad_k = _align_up(k // sf_vec_size, 4)
 
     topk_ids_cutlass_dtype = (
         cutlass.Int32 if topk_ids_dtype == torch.int32 else cutlass.Int64
@@ -1337,9 +1338,9 @@ def launch_sm120_static_moe(
 
         # Use runtime-m wrapper for non-graph paths (avoids per-m JIT).
         # Use original per-m kernel for CUDA graph capture (graph needs fixed shapes).
-        # MXFP4 (W4A4-mx): the RT wrapper is NVFP4-specialized (sf_vec_size=16);
-        # force the per-m static kernel until Stage D/E ports the RT path.
-        _use_rt = (not _is_cuda_graph_capturing()) and not _is_mxfp4
+        # The RT wrapper now parameterizes sf_vec_size, so mxfp4 uses it too
+        # (one module reused across all M instead of a per-m compile).
+        _use_rt = not _is_cuda_graph_capturing()
 
         if _use_rt:
             # RT path: fix tile shape to (128, 128) to avoid per-routed_rows recompilation.
@@ -1359,6 +1360,7 @@ def launch_sm120_static_moe(
                 mac_override=static_mac,
                 activation=activation,
                 activation_precision=activation_precision,
+                quant_mode=quant_mode,
             )
         else:
             compiled, mac = _get_static_kernel(
