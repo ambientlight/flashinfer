@@ -964,9 +964,10 @@ def _get_micro_kernel(
     single_token: bool = False,
     mac_override: int | None = None,
     activation: str = "silu",
+    quant_mode: str = "nvfp4",
 ):
     """Compile (or retrieve cached) the SM120 micro MoE kernel."""
-    sf_vec_size = 16
+    sf_vec_size, _micro_sf_dtype, _sf_block = _sf_params_for_quant_mode(quant_mode)
     sm_count = get_num_sm(torch.device("cuda"))
     mac = (
         mac_override
@@ -980,6 +981,7 @@ def _get_micro_kernel(
 
     cache_key = (
         "micro",
+        sf_vec_size,
         state_E,
         weight_E,
         m,
@@ -1002,7 +1004,7 @@ def _get_micro_kernel(
         return cached
 
     ab_dtype = cutlass.Float4E2M1FN
-    sf_dtype = cutlass.Float8E4M3FN
+    sf_dtype = _micro_sf_dtype
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
 
@@ -1022,7 +1024,7 @@ def _get_micro_kernel(
     w1_rows = (2 if is_gated else 1) * n
 
     rows_pad_k = _align_up(max_rows, 128)
-    cols_pad_k = _align_up(k // _NVFP4_BLOCK_SIZE, 4)
+    cols_pad_k = _align_up(k // sf_vec_size, 4)
 
     # Build fake tensors for compilation (identical to static kernel)
     a_input_fake = cute.runtime.make_fake_compact_tensor(
@@ -1245,11 +1247,10 @@ def launch_sm120_static_moe(
     use_micro = activation_precision == "fp4" and routed_rows <= micro_cutover
     _use_rt = False  # runtime-m wrapper flag (set in static non-graph path)
 
-    # MXFP4 (W4A4-mx) currently supports only the plain static kernel; the
-    # micro and runtime-m paths are NVFP4-specialized (Stage D/E will port them).
+    # MXFP4 (W4A4-mx) now supports the micro and plain-static kernels (Stage D
+    # ported their 32-element E8M0 quant). The runtime-m (RT) wrapper remains
+    # NVFP4-specialized, so it is disabled for mxfp4 below.
     _is_mxfp4 = _normalize_quant_mode(quant_mode) == "mxfp4"
-    if _is_mxfp4:
-        use_micro = False
 
     sm_count = get_num_sm(torch.device("cuda"))
     base_mac = min(get_max_active_clusters(1), sm_count)
@@ -1326,6 +1327,7 @@ def launch_sm120_static_moe(
             single_token=num_tokens == 1,
             mac_override=micro_mac,
             activation=activation,
+            quant_mode=quant_mode,
         )
     else:
         # Select tile shape for this batch
@@ -1456,10 +1458,9 @@ def select_sm120_moe_backend(
     mode = _normalize_quant_mode(quant_mode, activation_precision)
     if mode == "w4a16":
         return "w4a16"
-    # MXFP4 (W4A4-mx) currently has only the static kernel ported; the dynamic
-    # path is NVFP4-specialized (Stage D/E will port it).
-    if mode == "mxfp4":
-        return "static"
+    # MXFP4 (W4A4-mx): static for small routed sets, dynamic above the cutover
+    # (Stage D ported the dynamic kernel's 32-element E8M0 quant). The cutover
+    # uses the "fp4" ladder since the routing/tiling geometry is identical.
     routed_rows = num_tokens * num_topk
     if routed_rows <= _get_static_compact_cutover_pairs("fp4"):
         return "static"
@@ -1809,6 +1810,7 @@ def _get_dynamic_kernel(
     activation: str = "silu",
     activation_precision: str = "fp4",
     share_input_across_experts: bool = False,
+    quant_mode: str = "nvfp4",
 ):
     """Compile (or retrieve cached) the SM120 dynamic MoE kernel."""
     activation_precision = _normalize_activation_precision(activation_precision)
@@ -1819,7 +1821,7 @@ def _get_dynamic_kernel(
     share_input_across_experts = bool(
         share_input_across_experts and activation_precision == "fp4"
     )
-    sf_vec_size = 16
+    sf_vec_size, sf_dtype, _sf_block = _sf_params_for_quant_mode(quant_mode)
     sm_count = get_num_sm(torch.device("cuda"))
     mac = min(get_max_active_clusters(1), sm_count)
     mma_tiler_mn = (
@@ -1830,6 +1832,7 @@ def _get_dynamic_kernel(
     cache_key = (
         "dynamic",
         activation_precision,
+        sf_vec_size,
         E,
         k,
         n,
@@ -1851,7 +1854,6 @@ def _get_dynamic_kernel(
 
     scratch_dtype = cutlass.Float4E2M1FN
     weight_dtype = cutlass.Float4E2M1FN
-    sf_dtype = cutlass.Float8E4M3FN
     a_dtype = cutlass.BFloat16
     alpha_dtype = cutlass.Float32
 
@@ -2056,6 +2058,7 @@ def launch_sm120_dynamic_moe(
     fast_math: bool = True,
     activation: str = "silu",
     activation_precision: str = "fp4",
+    quant_mode: str = "nvfp4",
 ) -> torch.Tensor:
     """Launch the SM120 dynamic MoE kernel."""
     activation_precision = _normalize_activation_precision(activation_precision)
@@ -2084,6 +2087,7 @@ def launch_sm120_dynamic_moe(
         activation=activation,
         activation_precision=activation_precision,
         share_input_across_experts=input_gs_is_shared,
+        quant_mode=quant_mode,
     )
 
     # Dynamic kernel: runtime-shaped args are DataPointer (pass data_ptr()),
@@ -2758,6 +2762,7 @@ def launch_sm120_moe(
             n=n,
             k=k,
             activation_precision=activation_precision,
+            quant_mode=quant_mode,
         )
     )
 
@@ -2790,6 +2795,7 @@ def launch_sm120_moe(
             num_tokens=num_tokens,
             num_topk=top_k,
             activation_precision=activation_precision,
+            quant_mode=quant_mode,
         )
         # The dynamic kernel indexes row_counts/expert_write_rows directly with
         # topk_ids but those buffers are sized with num_local_experts. Unless
@@ -2830,6 +2836,7 @@ def launch_sm120_moe(
             fast_math=fast_math,
             activation=activation,
             activation_precision=activation_precision,
+            quant_mode=quant_mode,
         )
     else:
         return launch_sm120_static_moe(
@@ -2850,4 +2857,5 @@ def launch_sm120_moe(
             fast_math=fast_math,
             activation=activation,
             activation_precision=activation_precision,
+            quant_mode=quant_mode,
         )
