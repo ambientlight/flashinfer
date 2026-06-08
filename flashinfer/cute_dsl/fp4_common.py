@@ -2439,22 +2439,16 @@ def relu2_quantize_block_fp4(
 
 
 # =============================================================================
-# MXFP4 (W4A4-mx) activation quantizers — 32-element blocks, E8M0 (UE8M0)
-# block scale, SELF-SCALING (no per-expert global scale).
-#
-# Mirrors the NVFP4 16-block helpers above but:
-#   * 32 elements per block  -> 16 packed bytes -> TWO uint64 (lo, hi)
-#   * scale is E8M0 (power of two), computed directly from the block max via
-#     cvt_f32_to_ue8m0(max_abs / 6.0): exponent = ceil(log2(max_abs/6)) + 127,
-#     which guarantees |value / block_scale| <= FLOAT4_E2M1_MAX (=6) with the
-#     tightest exponent. There is NO global_scale_val (E8M0 is self-scaling),
-#     so the input_gs / down_input_scale plumbing is bypassed in MXF4 mode.
-#   * returns the E8M0 scale BYTE (uint8) directly, no E4M3 conversion.
+# MXFP4 (W4A4-mx) activation quantizers: 32-element blocks, E8M0 power-of-two
+# block scale, self-scaling (no global scale). Mirror the NVFP4 16-block helpers
+# above; 32 elems -> 16 bytes -> two uint64, and return the E8M0 scale byte.
 # =============================================================================
 
 
 @cute.jit
-def quantize_and_pack_32(y_f32: cute.Tensor, inv_scale: Float32) -> Tuple[Uint64, Uint64]:
+def quantize_and_pack_32(
+    y_f32: cute.Tensor, inv_scale: Float32
+) -> Tuple[Uint64, Uint64]:
     """Quantize 32 float32 values to FP4 and pack into two uint64 (lo, hi)."""
     q = cute.make_rmem_tensor((32,), Float32)
     for i in cutlass.range_constexpr(32):
@@ -2477,19 +2471,17 @@ def quantize_block_mxf4(
 ) -> Tuple[Uint64, Uint64, Uint8]:
     """Quantize 32 float32 values to packed FP4 (2x uint64) + E8M0 scale byte.
 
-    MXFP4 self-scaling: the block scale is the power of two
-    ``2^(ceil(log2(max_abs/6)))`` encoded as a UE8M0 byte. No global scale.
-    Returns ``(packed_lo, packed_hi, scale_byte)``.
+    Self-scaling: block scale is ``2^ceil(log2(max_abs/6))`` as a UE8M0 byte
+    (no global scale). Returns ``(packed_lo, packed_hi, scale_byte)``.
     """
     packed_lo = Uint64(0)
     packed_hi = Uint64(0)
     scale_byte = Uint8(0)
     if max_abs > Float32(0.0):
-        # E8M0 exponent that maps the block max to <= FLOAT4_E2M1_MAX (6).
+        # /6 so the block max maps to <= FLOAT4_E2M1_MAX, not overflow.
         ue8m0 = cvt_f32_to_ue8m0(max_abs / Float32(FLOAT4_E2M1_MAX))
         scale_byte = Uint8(ue8m0 & Uint32(0xFF))
-        # inv_scale = 2^(127 - ue8m0) = 1 / block_scale.
-        inv_scale = ue8m0_to_output_scale(ue8m0)
+        inv_scale = ue8m0_to_output_scale(ue8m0)  # 2^(127 - ue8m0) = 1/scale
         packed_lo, packed_hi = quantize_and_pack_32(values, inv_scale)
     return packed_lo, packed_hi, scale_byte
 
@@ -2499,12 +2491,9 @@ def quantize_block_mxf4_fast(
     values: cute.Tensor,
     max_abs: Float32,
 ) -> Tuple[Uint64, Uint64, Uint8]:
-    """Fast MXFP4 block quantization.
+    """Alias of quantize_block_mxf4 (the E8M0 path is already single-pass).
 
-    The E8M0 path is already a single power-of-two exponent computed via
-    hardware ``lg2.approx`` + ``ex2.approx``, so the "fast" variant is identical
-    to ``quantize_block_mxf4`` (kept for call-site symmetry with the NVFP4
-    ``quantize_block_fp4_fast``).
+    Kept for call-site symmetry with the NVFP4 quantize_block_fp4_fast.
     """
     return quantize_block_mxf4(values, max_abs)
 

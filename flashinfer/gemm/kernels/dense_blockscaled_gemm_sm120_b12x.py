@@ -141,9 +141,8 @@ class DenseGemmKernel:
         self.mma_register_requirement = 232
 
     def _setup_attributes(self):
-        # W4A4-mx: sf_vec_size==32 selects the MXF4 atom (E8M0 32-block scales),
-        # else the NVF4 atom (E4M3 16-block). Both share MMA shape (16,8,64);
-        # only sf_vec_size/sf_type differ.
+        # sf_vec_size==32 -> MXF4 atom (E8M0 32-block); else NVF4 (E4M3 16-block).
+        # Both share MMA shape (16,8,64); only sf_vec_size/sf_type differ.
         if self.sf_vec_size == 32:
             mma_op = cute.nvgpu.warp.MmaMXF4Op(
                 self.a_dtype,
@@ -400,12 +399,8 @@ class DenseGemmKernel:
         thr_vmk = (thr_vmnk[0], (thr_vmnk[1], thr_vmnk[3]))
         partitioned_sfa = thr_tensor[thr_vmk, (None, None)]
         partitioned_sfa = cute.group_modes(cute.flatten(partitioned_sfa), 0, 2)
-        # For sf_vec_size=32 (MXF4, mma_nsf=2) the SF SMEM K-factoring leaves an
-        # extra trailing K-mode, making the fragment rank-4 while the MMA loop
-        # and the data-operand fragments are rank-3 (mode[2] == num_k_blocks).
-        # Collapse any trailing K-modes into a single mode so the
-        # `[None, None, k_block_idx]` copy/gemm indexing stays congruent.
-        # No-op for NVF4 (already rank-3).
+        # sf_vec_size=32 (MXF4, mma_nsf=2) leaves a rank-4 fragment; collapse the
+        # trailing K-modes to rank-3 (mode[2] == num_k_blocks). No-op for NVF4.
         if cute.rank(partitioned_sfa) > 3:
             partitioned_sfa = cute.group_modes(
                 partitioned_sfa, 2, cute.rank(partitioned_sfa)
@@ -1458,9 +1453,7 @@ class DenseGemmKernel:
         # The current target only supports FP4 (MmaMXF4NVF4Op / MmaMXF4Op)
         if ab_dtype != cutlass.Float4E2M1FN:
             return False
-        # SM120 warp-level block-scaled FP4: two configs are valid —
-        #   sf_vec_size=16 + E4M3 (NVF4, MmaMXF4NVF4Op)
-        #   sf_vec_size=32 + E8M0 (MXF4, MmaMXF4Op)
+        # Two valid block-scaled FP4 configs: (16, E4M3) NVF4 / (32, E8M0) MXF4.
         if sf_vec_size == 16:
             if sf_dtype != cutlass.Float8E4M3FN:
                 return False
