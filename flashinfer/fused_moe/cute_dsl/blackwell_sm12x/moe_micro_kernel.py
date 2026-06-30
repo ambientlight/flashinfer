@@ -111,6 +111,7 @@ from flashinfer.cute_dsl.fp4_common import (
     atomic_add_global_i32,
     fabs_f32,
     fmax_f32,
+    fmin_f32,
     rcp_approx_ftz,
     quantize_block_fp4,
     quantize_block_fp4_fast,
@@ -370,8 +371,11 @@ class MoEMicroKernel:
         share_input_across_experts: bool = False,
         share_expert_scales: bool = False,
         single_token: bool = False,
+        swiglu_alpha: float = 1.702,
+        swiglu_limit: float = 7.0,
+        swiglu_beta: float = 1.0,
     ):
-        if activation not in {"silu", "relu2"}:
+        if activation not in {"silu", "relu2", "swigluoai"}:
             raise ValueError(f"unsupported activation {activation!r}")
         self._dense_cls = DenseGemmKernel
         self.acc_dtype = cutlass.Float32
@@ -379,7 +383,11 @@ class MoEMicroKernel:
         self.input_scales_are_reciprocal = input_scales_are_reciprocal
         self.fast_math = fast_math
         self.activation = activation
-        self.is_gated = activation == "silu"
+        self.is_gated = activation in ("silu", "swigluoai")
+        self.is_swigluoai = activation == "swigluoai"
+        self.swiglu_alpha = float(swiglu_alpha)
+        self.swiglu_limit = float(swiglu_limit)
+        self.swiglu_beta = float(swiglu_beta)
         # For m=1 with a shared input scale, the quantized activation is
         # identical across all K top-k experts. When set, only pair_idx==0
         # does the quantize and all pairs read from a single shared slot
@@ -1940,18 +1948,37 @@ class MoEMicroKernel:
                                 gate_slice = tRS_rGate[(None, mma_m, mma_n)]
                                 if cutlass.const_expr(self.is_gated):
                                     up_slice = tRS_rUp[(None, mma_m, mma_n)]
-                                    for elem_idx in cutlass.range_constexpr(
-                                        cute.size(tRS_rD_slice)
-                                    ):
-                                        g = alpha_value * gate_slice[elem_idx]
-                                        u = alpha_value * up_slice[elem_idx]
-                                        sigmoid_g = cute.arch.rcp_approx(
-                                            cutlass.Float32(1.0)
-                                            + cute.math.exp(
-                                                -g, fastmath=self.fast_math
-                                            ),
-                                        )
-                                        tRS_rD_slice[elem_idx] = g * sigmoid_g * u
+                                    if cutlass.const_expr(self.is_swigluoai):
+                                        L = cutlass.Float32(self.swiglu_limit)
+                                        A = cutlass.Float32(self.swiglu_alpha)
+                                        B = cutlass.Float32(self.swiglu_beta)
+                                        for elem_idx in cutlass.range_constexpr(
+                                            cute.size(tRS_rD_slice)
+                                        ):
+                                            g = alpha_value * gate_slice[elem_idx]
+                                            u = alpha_value * up_slice[elem_idx]
+                                            g = fmin_f32(g, L)
+                                            u = fmax_f32(fmin_f32(u, L), -L)
+                                            sig = cute.arch.rcp_approx(
+                                                cutlass.Float32(1.0)
+                                                + cute.math.exp(
+                                                    -A * g, fastmath=self.fast_math
+                                                ),
+                                            )
+                                            tRS_rD_slice[elem_idx] = g * sig * (u + B)
+                                    else:
+                                        for elem_idx in cutlass.range_constexpr(
+                                            cute.size(tRS_rD_slice)
+                                        ):
+                                            g = alpha_value * gate_slice[elem_idx]
+                                            u = alpha_value * up_slice[elem_idx]
+                                            sigmoid_g = cute.arch.rcp_approx(
+                                                cutlass.Float32(1.0)
+                                                + cute.math.exp(
+                                                    -g, fastmath=self.fast_math
+                                                ),
+                                            )
+                                            tRS_rD_slice[elem_idx] = g * sigmoid_g * u
                                 else:
                                     for elem_idx in cutlass.range_constexpr(
                                         cute.size(tRS_rD_slice)

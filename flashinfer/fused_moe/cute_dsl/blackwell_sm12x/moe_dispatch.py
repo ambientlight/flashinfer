@@ -51,6 +51,20 @@ _MICRO_SHARE_INPUT_ACROSS_EXPERTS = (
     os.environ.get("FLASHINFER_B12X_MICRO_SHARE_INPUT", "1") != "0"
 )
 
+# Dynamic-M (symbolic token count) for the STATIC MoE kernel. When enabled, the
+# static kernel is compiled with the leading token dimension M as a CuTe DSL
+# SymInt (cute.sym_int32) instead of a concrete int, and `m` is dropped from the
+# compile cache key. This lets ONE compiled kernel serve all token counts that
+# share a (mma_tiler_mn, mac) bucket, collapsing the per-`m` JIT recompiles that
+# otherwise stall the serving scheduler under variable-prefill agentic load
+# (compiles go from unbounded -> bounded by the tile/MAC ladders). Validated
+# numerically equivalent to the concrete-`m` path (within the MoE's atomic-scatter
+# noise floor) on SM120 / cutlass-dsl 4.5.2. Default ON; set =0 to A/B back to the
+# original per-`m` specialization. Only the static path is affected; the micro
+# path only ever sees routed_rows<=40 (M<=10), a tiny finite set that never thrashes.
+_STATIC_DYNAMIC_M = os.environ.get("FLASHINFER_B12X_STATIC_DYNAMIC_M", "1") != "0"
+
+
 # Micro kernel cutover thresholds (routed pairs)
 _MICRO_COMPACT_CUTOVER_PAIRS = 20
 _MICRO_COMPACT_CUTOVER_PAIRS_MULTI_TOPK = 40
@@ -524,6 +538,9 @@ def _get_static_kernel(
     activation: str = "silu",
     activation_precision: str = "fp4",
     quant_mode: str = "nvfp4",
+    swiglu_alpha: float = 1.702,
+    swiglu_limit: float = 7.0,
+    swiglu_beta: float = 1.0,
 ):
     """Compile (or retrieve cached) the SM120 static MoE kernel."""
     activation_precision = _normalize_activation_precision(activation_precision)
@@ -545,13 +562,18 @@ def _get_static_kernel(
     if activation_precision == "fp4" and num_topk > 1:
         mma_tiler_mn = _select_moe_mma_tiler_mn(routed_rows, n)
 
+    # Dynamic-M: compile once per (tile, mac) bucket and reuse across all token
+    # counts. `m` still drives tile/MAC selection (those ARE bucketed via the
+    # ladders) but is dropped from the compile key so a new token count that lands
+    # in an existing bucket hits the cache instead of recompiling.
+    m_key = None if _STATIC_DYNAMIC_M else m
     cache_key = (
         "static",
         activation_precision,
         sf_vec_size,
         state_E,
         weight_E,
-        m,
+        m_key,
         k,
         n,
         num_topk,
@@ -562,6 +584,9 @@ def _get_static_kernel(
         input_scales_are_reciprocal,
         fast_math,
         activation,
+        swiglu_alpha,
+        swiglu_limit,
+        swiglu_beta,
     )
     cached = _STATIC_KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -580,18 +605,34 @@ def _get_static_kernel(
         fast_math=fast_math,
         activation=activation,
         input_scales_are_reciprocal=input_scales_are_reciprocal,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_limit=swiglu_limit,
+        swiglu_beta=swiglu_beta,
     )
 
-    is_gated = activation == "silu"
+    is_gated = activation in ("silu", "swigluoai")
     w1_rows = (2 if is_gated else 1) * n  # 2*n for gated, n for non-gated
 
     rows_pad_k = _align_up(max_rows, 128)
     cols_pad_k = _align_up(k // sf_vec_size, 4)
 
+    # Token-count dimensions for the fake tensors. With dynamic-M, make the
+    # leading token dim a CuTe SymInt so the compiled kernel is reused across all
+    # M; reuse ONE `m_dim` object for a_input and scatter (so their row counts are
+    # known-equal), and derive `pairs_dim = m_dim * num_topk` for the flattened
+    # top-k arrays (carries the m*topk relation, divisibility=num_topk). With the
+    # flag off these are plain ints -> the original per-`m` specialization.
+    if _STATIC_DYNAMIC_M:
+        m_dim = cute.sym_int32(symbol="M")
+        pairs_dim = m_dim * num_topk
+    else:
+        m_dim = m
+        pairs_dim = m * num_topk
+
     # Build fake tensors for compilation
     a_input_fake = cute.runtime.make_fake_compact_tensor(
         a_dtype,
-        (m, k),
+        (m_dim, k),
         stride_order=(1, 0),
         assumed_align=16,
     )
@@ -601,12 +642,12 @@ def _get_static_kernel(
     topk_ids_align = 4 if topk_ids_dtype == torch.int32 else 8
     topk_ids_fake = cute.runtime.make_fake_compact_tensor(
         topk_ids_cutlass_dtype,
-        (m * num_topk,),
+        (pairs_dim,),
         assumed_align=topk_ids_align,
     )
     topk_weights_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32,
-        (m * num_topk,),
+        (pairs_dim,),
         assumed_align=4,
     )
     packed_a_fake = cute.runtime.make_fake_compact_tensor(
@@ -692,7 +733,7 @@ def _get_static_kernel(
     )
     scatter_fake = cute.runtime.make_fake_compact_tensor(
         a_dtype,
-        (m, k),
+        (m_dim, k),
         stride_order=(1, 0),
         assumed_align=16,
     )
@@ -765,6 +806,9 @@ def _get_micro_kernel(
     mac_override: int | None = None,
     activation: str = "silu",
     quant_mode: str = "nvfp4",
+    swiglu_alpha: float = 1.702,
+    swiglu_limit: float = 7.0,
+    swiglu_beta: float = 1.0,
 ):
     """Compile (or retrieve cached) the SM120 micro MoE kernel."""
     sf_vec_size, _micro_sf_dtype, _sf_block = _sf_params_for_quant_mode(quant_mode)
@@ -798,6 +842,9 @@ def _get_micro_kernel(
         share_expert_scales,
         single_token,
         activation,
+        swiglu_alpha,
+        swiglu_limit,
+        swiglu_beta,
     )
     cached = _MICRO_KERNEL_CACHE.get(cache_key)
     if cached is not None:
@@ -818,9 +865,12 @@ def _get_micro_kernel(
         share_input_across_experts=share_input_across_experts,
         share_expert_scales=share_expert_scales,
         single_token=single_token,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_limit=swiglu_limit,
+        swiglu_beta=swiglu_beta,
     )
 
-    is_gated = activation == "silu"
+    is_gated = activation in ("silu", "swigluoai")
     w1_rows = (2 if is_gated else 1) * n
 
     rows_pad_k = _align_up(max_rows, 128)
@@ -1012,6 +1062,9 @@ def launch_sm120_static_moe(
     activation: str = "silu",
     activation_precision: str = "fp4",
     quant_mode: str = "nvfp4",
+    swiglu_alpha: float = 1.702,
+    swiglu_limit: float = 7.0,
+    swiglu_beta: float = 1.0,
 ) -> torch.Tensor:
     """Launch the SM120 static or micro MoE kernel.
 
@@ -1126,6 +1179,9 @@ def launch_sm120_static_moe(
             mac_override=micro_mac,
             activation=activation,
             quant_mode=quant_mode,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_limit=swiglu_limit,
+            swiglu_beta=swiglu_beta,
         )
     else:
         compiled, mac = _get_static_kernel(
@@ -1143,6 +1199,9 @@ def launch_sm120_static_moe(
             activation=activation,
             activation_precision=activation_precision,
             quant_mode=quant_mode,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_limit=swiglu_limit,
+            swiglu_beta=swiglu_beta,
         )
         launch_ids = flat_ids
 
@@ -1547,6 +1606,9 @@ def _get_dynamic_kernel(
     activation_precision: str = "fp4",
     share_input_across_experts: bool = False,
     quant_mode: str = "nvfp4",
+    swiglu_alpha: float = 1.702,
+    swiglu_limit: float = 7.0,
+    swiglu_beta: float = 1.0,
 ):
     """Compile (or retrieve cached) the SM120 dynamic MoE kernel."""
     activation_precision = _normalize_activation_precision(activation_precision)
@@ -1580,12 +1642,15 @@ def _get_dynamic_kernel(
         fast_math,
         activation,
         share_input_across_experts,
+        swiglu_alpha,
+        swiglu_limit,
+        swiglu_beta,
     )
     cached = _DYNAMIC_KERNEL_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
-    is_gated = activation == "silu"
+    is_gated = activation in ("silu", "swigluoai")
     w1_rows = (2 if is_gated else 1) * n
 
     scratch_dtype = cutlass.Float4E2M1FN
@@ -1600,6 +1665,9 @@ def _get_dynamic_kernel(
         fast_math=fast_math,
         activation=activation,
         share_input_across_experts=share_input_across_experts,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_limit=swiglu_limit,
+        swiglu_beta=swiglu_beta,
     )
     launch = _DynamicMoELaunch(
         kernel,
@@ -1795,6 +1863,9 @@ def launch_sm120_dynamic_moe(
     activation: str = "silu",
     activation_precision: str = "fp4",
     quant_mode: str = "nvfp4",
+    swiglu_alpha: float = 1.702,
+    swiglu_limit: float = 7.0,
+    swiglu_beta: float = 1.0,
 ) -> torch.Tensor:
     """Launch the SM120 dynamic MoE kernel."""
     activation_precision = _normalize_activation_precision(activation_precision)
@@ -1824,6 +1895,9 @@ def launch_sm120_dynamic_moe(
         activation_precision=activation_precision,
         share_input_across_experts=input_gs_is_shared,
         quant_mode=quant_mode,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_limit=swiglu_limit,
+        swiglu_beta=swiglu_beta,
     )
 
     # Dynamic kernel: runtime-shaped args are DataPointer (pass data_ptr()),
@@ -2436,6 +2510,9 @@ def launch_sm120_moe(
     activation_precision: str = "fp4",
     quant_mode: str | None = None,
     source_format: str = "modelopt",
+    swiglu_alpha: float = 1.702,
+    swiglu_limit: float = 7.0,
+    swiglu_beta: float = 1.0,
     _workspace=None,
     _weight_views=None,
     _prepared_weights=None,
@@ -2453,7 +2530,7 @@ def launch_sm120_moe(
 
     num_tokens = topk_ids.size(0)
     k = a.size(1)  # hidden_size
-    is_gated = activation == "silu"
+    is_gated = activation in ("silu", "swigluoai")
     # w1_weight.size(1) is 2*n for gated or n for non-gated
     intermediate_size = w1_weight.size(1) // 2 if is_gated else w1_weight.size(1)
     n = intermediate_size
@@ -2573,6 +2650,9 @@ def launch_sm120_moe(
             activation=activation,
             activation_precision=activation_precision,
             quant_mode=quant_mode,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_limit=swiglu_limit,
+            swiglu_beta=swiglu_beta,
         )
     else:
         return launch_sm120_static_moe(
@@ -2594,4 +2674,7 @@ def launch_sm120_moe(
             activation=activation,
             activation_precision=activation_precision,
             quant_mode=quant_mode,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_limit=swiglu_limit,
+            swiglu_beta=swiglu_beta,
         )
